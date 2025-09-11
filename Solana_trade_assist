@@ -1,99 +1,136 @@
 """
-solana_trade_assist.py
+Solana Trade Assist (PTB 22.x + Solana 0.36.9)
 
 Flow:
-- Watch WATCH_WALLET via Helius (polling).
-- When token transfers detected, gather token health info (supply, top holders, mint authority, Jupiter checks).
-- Send Telegram alert with InlineKeyboard: BUY25 / BUY50 / BUY100 / IGNORE.
-- If BUY pressed -> create & send Jupiter swap (SOL -> token) signing locally using PRIVATE_KEY from .env
-  -> record entry price, start monitor (45 min OR +1500%).
-- When condition triggers -> alert with SELL25/SELL50/SELL100/HOLD buttons.
-- If SELL pressed -> create & send Jupiter swap (token -> SOL) for the chosen percent.
+- Poll Helius for WATCH_WALLET activity.
+- On activity, compute token health and post to Telegram with BUY buttons.
+- BUY triggers Jupiter swap (SOL -> token), records position, and starts monitor.
+- Monitor alerts when either 45 mins elapse or profit multiple is reached, with SELL buttons.
+- SELL triggers Jupiter swap (token -> SOL).
 
-WARNING: HIGH RISK. Test with dust amounts. Keep PRIVATE_KEY local and secret.
+WARNING: High risk. Test with dust. Keep PRIVATE_KEY secret and local.
 """
 
 import os
 import time
 import json
-import threading
-import requests
+import asyncio
+from typing import Tuple, Dict, Any, Optional, Set
 from decimal import Decimal
+
+import requests
 from dotenv import load_dotenv
+
 from solana.rpc.api import Client as SolanaClient
-from solders.transaction import Transaction
-from solana.rpc.commitment import Confirmed
-from solders.pubkey import Pubkey
-from solders.keypair import Keypair
 from solana.rpc.types import TxOpts
-from base64 import b64decode, b64encode
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction  # for Jupiter unsigned tx
+from base64 import b64decode
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes
+)
 
-# ----------------- CONFIG (from .env) -----------------
+# ----------------- CONFIG (.env) -----------------
 load_dotenv()
 
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key=a3f0e5d2-bc4c-466a-86ee-9ec7ea206c21"
-HELIUS_TX_ENDPOINT = "https://api.helius.xyz/v0/addresses"
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY") or ""
+if not HELIUS_API_KEY:
+    raise RuntimeError("Missing HELIUS_API_KEY in .env")
 
-BOT_TOKEN = os.getenv("8202279061:AAFhDEupzB")
-CHAT_ID = int(os.getenv("1606358888"))
-WATCH_WALLET = os.getenv("Cg5FnnWokLxZhorzBByh3B6o8gZVhNQqqbCq5F1cuxFm")
-MY_WALLET = os.getenv("E8f759jQq163o32GdTMcWGqfgkJKhGXnAJKKVJGM1Txx")
-PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY")  # base58 secret key string (local only)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN in .env")
+
+CHAT_ID_RAW = os.getenv("CHAT_ID")
+CHAT_ID: Optional[int] = int(CHAT_ID_RAW) if CHAT_ID_RAW and CHAT_ID_RAW.isdigit() else None
+if CHAT_ID is None:
+    raise RuntimeError("CHAT_ID missing or not an integer in .env")
+
+WATCH_WALLET = os.getenv("WATCH_WALLET") or ""
+if not WATCH_WALLET:
+    raise RuntimeError("Missing WATCH_WALLET in .env")
+
+MY_WALLET = os.getenv("MY_WALLET") or ""
+if not MY_WALLET:
+    raise RuntimeError("Missing MY_WALLET in .env")
+
+PRIVATE_KEY_RAW = (os.getenv("PRIVATE_KEY") or "").strip()
+if not PRIVATE_KEY_RAW:
+    raise RuntimeError("Missing PRIVATE_KEY in .env")
+
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_TX_ENDPOINT = "https://api.helius.xyz/v0/addresses"
 
 # Jupiter endpoints
 JUPITER_TOKEN_LIST_URL = "https://tokens.jup.ag/tokens"
 JUPITER_QUOTE_V6 = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_V6 = "https://quote-api.jup.ag/v6/swap"  # swap endpoint returning unsigned TX or tx info
+JUPITER_SWAP_V6 = "https://quote-api.jup.ag/v6/swap"
+
+# Constants
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Solana client (Helius RPC)
 sol_client = SolanaClient(HELIUS_RPC)
 
-CHECK_INTERVAL = 12  # poll interval seconds
-MONITOR_POLL = 10    # poll price check interval seconds
-PROFIT_MULTIPLIER = Decimal("15.0")  # 15x => 1500%
-MAX_WAIT_SECONDS = 45 * 60  # 45 minutes
+# Timings and thresholds
+CHECK_INTERVAL = 12          # seconds
+MONITOR_POLL = 10            # seconds
+PROFIT_MULTIPLIER = Decimal("15.0")  # 15x
+MAX_WAIT_SECONDS = 45 * 60   # 45 minutes
 
-# Simple position store: token_mint -> position data
-positions = {}  # structure: {mint: {entry_price_ft: Decimal, token_amount: Decimal, lamports_spent: int, start_ts: int}}
+# State
+positions: Dict[str, Dict[str, Any]] = {}   # {mint: {...}}
+_last_sig: Optional[str] = None
 
-# Telegram App (we'll create Application later)
-app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# ----------------- Helpers: Solana RPC via Helius -----------------
-def hel_rpccall(method: str, params: list):
+# ----------------- Utils: keys, rpc, helpers -----------------
+def load_keypair_from_env() -> Keypair:
+    raw = PRIVATE_KEY_RAW
+    # JSON array format (solana-keygen)
+    if raw.startswith("["):
+        arr = json.loads(raw)
+        return Keypair.from_secret_key(bytes(arr))
+    # Base58 secret key
+    return Keypair.from_base58_string(raw)
+
+
+def hel_rpccall(method: str, params: list) -> Dict[str, Any]:
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(HELIUS_RPC, json=payload, timeout=12)
+    r = requests.post(HELIUS_RPC, json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def get_token_supply(mint: str):
+
+def get_token_supply(mint: str) -> Dict[str, Any]:
     res = hel_rpccall("getTokenSupply", [mint])
-    return res.get("result", {}).get("value", {})
+    return res.get("result", {}).get("value", {}) or {}
+
 
 def get_token_largest_accounts(mint: str):
     res = hel_rpccall("getTokenLargestAccounts", [mint])
-    return res.get("result", {}).get("value", [])
+    return res.get("result", {}).get("value", []) or []
 
-def get_account_info_parsed(pubkey: str):
+
+def get_account_info_parsed(pubkey: str) -> Dict[str, Any]:
     res = hel_rpccall("getAccountInfo", [pubkey, {"encoding": "jsonParsed"}])
-    return res.get("result", {}).get("value", {})
+    return res.get("result", {}).get("value", {}) or {}
 
-# token metadata via on-chain metadata (try with getAccountInfo parsed on mint)
-def get_token_metadata(mint: str):
-    # We will try to read token name/symbol from on-chain metadata via metaplex convention - but many tokens don't have metadata.
-    # Simpler fallback: return mint as id; user can inspect further if needed.
-    # For now attempt to read mint account info and return something minimal.
-    info = get_account_info_parsed(mint)
-    return info
 
-def check_mint_authority(mint: str) -> tuple [str, int]: # returns (mint_authority, freeze_authority)
+def get_token_metadata(mint: str) -> Dict[str, Any]:
+    return get_account_info_parsed(mint)
+
+
+def check_mint_authority(mint: str) -> Tuple[str, str]:
     info = get_account_info_parsed(mint)
     if not info:
-        return "UNKNOWN", "Unable to read mint account"
+        return "UNKNOWN", "UNKNOWN"
     try:
         parsed = info.get("data", {}).get("parsed", {})
         mint_info = parsed.get("info", {})
@@ -101,63 +138,153 @@ def check_mint_authority(mint: str) -> tuple [str, int]: # returns (mint_authori
         freeze_auth = mint_info.get("freezeAuthority")
         ma = mint_auth if mint_auth else "None (renounced)"
         fa = freeze_auth if freeze_auth else "None (renounced)"
-        return ma, fa
+        return str(ma), str(fa)
     except Exception as e:
-        return "ERROR", str(e)
+        return "ERROR", f"{e}"
 
-# Jupiter checks
+
 def jupiter_token_known(mint: str) -> bool:
     try:
-        r = requests.get(JUPITER_TOKEN_LIST_URL, timeout=10)
+        r = requests.get(JUPITER_TOKEN_LIST_URL, timeout=12)
         r.raise_for_status()
         tokens = r.json()
         return any(t.get("address") == mint for t in tokens)
     except Exception:
         return False
 
-def jupiter_route_probe_to_sol(mint: str, amount_raw: int):
+
+def jupiter_route_probe_to_sol(mint: str, amount_raw: int) -> Dict[str, Any]:
     try:
-        params = {"inputMint": mint, "outputMint": "So11111111111111111111111111111111111111112", "amount": str(amount_raw), "slippageBps": "500"}
-        r = requests.get(JUPITER_QUOTE_V6, params=params, timeout=12)
+        params = {"inputMint": mint, "outputMint": SOL_MINT, "amount": str(amount_raw), "slippageBps": "500"}
+        r = requests.get(JUPITER_QUOTE_V6, params=params, timeout=20)
         if r.status_code != 200:
             return {"ok": False, "data": r.text}
         j = r.json()
-        if j.get("data"):
-            return {"ok": True, "data": j}
-        return {"ok": False, "data": j}
+        return {"ok": bool(j.get("data")), "data": j}
     except Exception as e:
         return {"ok": False, "data": str(e)}
 
-# Utilities
+
 def human_amount_from_ui(amount, decimals):
     try:
         return Decimal(amount) / (Decimal(10) ** Decimal(decimals))
     except Exception:
         return amount
 
-# ----------------- Telegram message + button utilities -----------------
-def build_buy_keyboard(mint):
+
+def get_sol_balance_lamports(pubkey: str) -> int:
+    try:
+        resp = sol_client.get_balance(Pubkey.from_string(pubkey))
+        # Friendly handling across versions
+        if isinstance(resp, dict):
+            return int(resp.get("result", {}).get("value", 0))
+        # RPCResponse-like
+        if hasattr(resp, "value"):
+            return int(resp.value)
+        # Fallback
+        return int(resp.get("result", {}).get("value", 0))
+    except Exception as e:
+        print("Balance fetch error", e)
+        return 0
+
+
+# ----------------- Jupiter quote/swap -----------------
+def request_jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 500) -> Dict[str, Any]:
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps)
+    }
+    r = requests.get(JUPITER_QUOTE_V6, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+
+def request_jupiter_swap(route: Dict[str, Any], user_pubkey: str) -> Dict[str, Any]:
+    body = {"route": route, "userPublicKey": user_pubkey}
+    r = requests.post(JUPITER_SWAP_V6, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_swap_b64(swap_resp: Dict[str, Any]) -> str:
+    # Common keys Jupiter uses
+    for key in ["swapTransaction", "swapTx", "unsignedTransaction", "swapSerialized"]:
+        if key in swap_resp and isinstance(swap_resp[key], str):
+            return swap_resp[key]
+    data = swap_resp.get("data")
+    if isinstance(data, dict):
+        for key in ["swapTransaction", "swapTx", "rawTransaction"]:
+            if key in data and isinstance(data[key], str):
+                return data[key]
+    tx = swap_resp.get("tx")
+    if isinstance(tx, dict) and isinstance(tx.get("serialized"), str):
+        return tx["serialized"]
+    raise RuntimeError(f"Could not find serialized transaction in Jupiter response: {list(swap_resp.keys())}")
+
+
+def create_and_send_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 500, user_pubkey: Optional[str] = None) -> str:
+    """
+    Blocking. Use with asyncio.to_thread in async context.
+    1) Get quote
+    2) Request swap (unsigned tx)
+    3) Deserialize, sign with PRIVATE_KEY, send via Helius
+    Returns signature.
+    """
+    user_pubkey = user_pubkey or MY_WALLET
+
+    quote = request_jupiter_quote(input_mint, output_mint, amount, slippage_bps)
+    routes = quote.get("data") or []
+    if not routes:
+        raise RuntimeError("No route from Jupiter quote")
+
+    route = routes[0]
+    swap_resp = request_jupiter_swap(route, user_pubkey)
+    serialized_b64 = extract_swap_b64(swap_resp)
+
+    # Deserialize unsigned transaction
+    tx_bytes = b64decode(serialized_b64)
+    vtx = VersionedTransaction.from_bytes(tx_bytes)
+
+    # Sign with our keypair
+    kp = load_keypair_from_env()
+    # solders VersionedTransaction exposes sign([...]) in recent versions (0.26.0 included)
+    vtx.sign([kp])
+
+    signed_bytes = bytes(vtx)
+    send = sol_client.send_raw_transaction(signed_bytes, opts=TxOpts(skip_preflight=False))
+    sig = send.get("result")
+    if not sig:
+        raise RuntimeError(f"RPC did not return signature: {send}")
+    return sig
+
+
+# ----------------- UI builders -----------------
+def build_buy_keyboard(mint: str) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("BUY 25%", callback_data=f"BUY|25|{mint}"),
-         InlineKeyboardButton("BUY 50%", callback_data=f"BUY|50|{mint}"),
-         InlineKeyboardButton("BUY 100%", callback_data=f"BUY|100|{mint}")],
-        [InlineKeyboardButton("IGNORE", callback_data=f"IGNORE|{mint}")]
+         InlineKeyboardButton("BUY 50%", callback_data=f"BUY|50|{mint}")],
+        [InlineKeyboardButton("BUY 100%", callback_data=f"BUY|100|{mint}"),
+         InlineKeyboardButton("IGNORE", callback_data=f"IGNORE|{mint}")]
     ]
     return InlineKeyboardMarkup(kb)
 
-def build_sell_keyboard(mint):
+
+def build_sell_keyboard(mint: str) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("SELL 25%", callback_data=f"SELL|25|{mint}"),
-         InlineKeyboardButton("SELL 50%", callback_data=f"SELL|50|{mint}"),
-         InlineKeyboardButton("SELL 100%", callback_data=f"SELL|100|{mint}")],
-        [InlineKeyboardButton("HOLD", callback_data=f"HOLD|{mint}")]
+         InlineKeyboardButton("SELL 50%", callback_data=f"SELL|50|{mint}")],
+        [InlineKeyboardButton("SELL 100%", callback_data=f"SELL|100|{mint}"),
+         InlineKeyboardButton("HOLD", callback_data=f"HOLD|{mint}")]
     ]
     return InlineKeyboardMarkup(kb)
 
-# ----------------- Main token health builder -----------------
+
 def build_token_health(mint: str) -> str:
     lines = []
     lines.append(f"🔎 Token health for {mint}")
+
     # supply
     try:
         supply = get_token_supply(mint)
@@ -188,15 +315,12 @@ def build_token_health(mint: str) -> str:
     lines.append(f"• Mint authority: {ma}")
     lines.append(f"• Freeze authority: {fa}")
 
-    # Jupiter checks
+    # Jupiter
     known = jupiter_token_known(mint)
     lines.append(f"• Jupiter tokenlist: {'KNOWN' if known else 'UNKNOWN'}")
 
-    # route probe (probe with 1 * 10^decimals if decimals known, else small amount)
     try:
-        probe_amount = 1
-        if decimals:
-            probe_amount = 10 ** int(decimals)
+        probe_amount = 10 ** int(decimals) if decimals else 1
         jr = jupiter_route_probe_to_sol(mint, probe_amount)
         if jr.get("ok"):
             lines.append("• Jupiter route to SOL: YES (routes found)")
@@ -208,14 +332,16 @@ def build_token_health(mint: str) -> str:
     lines.append("\nNote: Heuristics only. Check carefully before buying.")
     return "\n".join(lines)
 
-# ----------------- Watcher: poll Helius address txs -----------------
-_last_sig = None
 
-def poll_watch_wallet():
+# ----------------- Polling job (Helius watcher) -----------------
+async def poll_watch_wallet_job(context: ContextTypes.DEFAULT_TYPE):
     global _last_sig
+    if not (WATCH_WALLET and CHAT_ID):
+        return
+
     url = f"{HELIUS_TX_ENDPOINT}/{WATCH_WALLET}/transactions?api-key={HELIUS_API_KEY}"
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         txs = r.json()
     except Exception as e:
@@ -231,13 +357,12 @@ def poll_watch_wallet():
         return
     _last_sig = sig
 
-    token_transfers = latest.get("tokenTransfers", [])
-    swap_transfers = latest.get("swaps", [])
+    token_transfers = latest.get("tokenTransfers", []) or []
+    swap_transfers = latest.get("swaps", []) or []
     if not token_transfers and not swap_transfers:
         return
 
-    # collect unique mints
-    mints = set()
+    mints: Set[str] = set()
     summary_lines = []
     for t in token_transfers:
         mint = t.get("mint")
@@ -245,158 +370,163 @@ def poll_watch_wallet():
         frm = t.get("fromUserAccount") or t.get("from")
         to = t.get("toUserAccount") or t.get("to")
         summary_lines.append(f"{amt} of {mint} from {frm} to {to}")
-        if mint: mints.add(mint)
+        if mint:
+            mints.add(mint)
+
     for s in swap_transfers:
         in_m = s.get("inTokenMint"); out_m = s.get("outTokenMint")
         if in_m: mints.add(in_m)
         if out_m: mints.add(out_m)
 
     header = f"🚨 WATCH_WALLET Activity detected:\nTx: https://solscan.io/tx/{sig}\n\nSummary:\n" + "\n".join(summary_lines)
-    # send header
     try:
-        app.bot.send_message(chat_id=CHAT_ID, text=header)
+        await context.bot.send_message(chat_id=CHAT_ID, text=header)
     except Exception as e:
         print("Telegram header send error", e)
 
-    # for each mint send health + buy buttons
     for mint in mints:
         try:
-            token_health = build_token_health(mint)
-            # include token name/symbol from metadata if possible (not always available)
-            # present buy buttons
-            app.bot.send_message(chat_id=CHAT_ID, text=token_health, reply_markup=build_buy_keyboard(mint))
+            token_health = await asyncio.to_thread(build_token_health, mint)
+            await context.bot.send_message(chat_id=CHAT_ID, text=token_health, reply_markup=build_buy_keyboard(mint))
         except Exception as e:
             print("Error building/sending token health", e)
 
-# ----------------- Jupiter swap helpers -----------------
-def get_sol_balance_lamports(pubkey: str) -> int:
+
+# ----------------- Buy/Sell flows (async wrappers) -----------------
+async def buy_flow_async(context: ContextTypes.DEFAULT_TYPE, percent: int, mint: str):
     try:
-        resp = sol_client.get_balance(Pubkey.from_string(pubkey))
-        if resp and resp.get("result"):
-            return int(resp["result"]["value"])
+        lamports = await asyncio.to_thread(get_sol_balance_lamports, MY_WALLET)
+        # small buffer for fees
+        buffer_lamports = 20000
+        spend = int((lamports - buffer_lamports) * (Decimal(percent) / Decimal(100)))
+        if spend <= 0:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"Insufficient SOL balance to buy {mint} at {percent}%. Balance: {lamports} lamports")
+            return
+
+        # Submit swap
+        sig = await asyncio.to_thread(create_and_send_swap, SOL_MINT, mint, spend, 500, MY_WALLET)
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"Buy tx submitted: {sig}")
+
+        # Record entry price estimate via quote
+        probe = await asyncio.to_thread(request_jupiter_quote, SOL_MINT, mint, spend, 500)
+        entry_price_ft = None
+        if (probe.get("data") and len(probe["data"]) > 0 and probe["data"][0].get("outAmount")):
+            token_out = int(probe["data"][0]["outAmount"])
+            if token_out > 0:
+                # lamports per token unit (base unit)
+                entry_price_ft = Decimal(spend) / Decimal(token_out)
+
+        positions[mint] = {
+            "lamports_spent": spend,
+            "entry_price_lamports_per_unit": entry_price_ft,
+            "start_ts": int(time.time())
+        }
+
+        asyncio.create_task(monitor_position_async(context, mint))
     except Exception as e:
-        print("Balance fetch error", e)
-    return 0
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"Buy flow error for {mint}: {e}")
 
-def create_and_send_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 500, user_pubkey: str = None):
-    """
-    Use Jupiter quote + swap endpoints to obtain swap transaction and submit it.
-    amount is amount in base units of input mint (for SOL use lamports).
-    Returns tx signature or raises.
-    """
-    if user_pubkey is None:
-        user_pubkey = MY_WALLET
 
-    # 1) Get quote from Jupiter
-    params = {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": str(amount),
-        "slippageBps": str(slippage_bps)
-    }
-    r = requests.get(JUPITER_QUOTE_V6, params=params, timeout=12)
-    r.raise_for_status()
-    quote = r.json()
-    if not quote.get("data"):
-        raise Exception("No route from Jupiter quote")
-
-    # pick the first route (best)
-    route = quote["data"][0]
-
-    # 2) Request swap transaction from Jupiter swap endpoint
-    # The Jupiter swap endpoint expects the quote response and some fields.
-    swap_body = {
-        "route": route,
-        "userPublicKey": user_pubkey,
-        # other optional fields could be included; allow Jupiter to return serialized transaction
-    }
-    r2 = requests.post(JUPITER_SWAP_V6, json=swap_body, timeout=12)
-    r2.raise_for_status()
-    swap_resp = r2.json()
-
-    # Jupiter v6 swap endpoint often returns serializedTransaction and/or transaction (base64)
-    # Common keys: 'swapTransaction' (b64), 'swapTx' or 'unsignedTransaction'
-    # Try to find serialized transaction
-    serialized_b64 = None
-    if isinstance(swap_resp, dict):
-        # try common keys:
-        for k in ["swapTransaction", "swapTx", "unsignedTransaction", "swapSerialized"]:
-            if swap_resp.get(k):
-                serialized_b64 = swap_resp[k]
-                break
-        # some endpoints return nested fields
-        if not serialized_b64 and "data" in swap_resp and isinstance(swap_resp["data"], dict):
-            for k in ["swapTransaction", "swapTx", "rawTransaction"]:
-                if swap_resp["data"].get(k):
-                    serialized_b64 = swap_resp["data"].get(k)
-                    break
-
-    if not serialized_b64:
-        # Last-resort: if Jupiter returned 'tx' as object with 'serialized' key
-        if swap_resp.get("tx") and isinstance(swap_resp["tx"], dict) and swap_resp["tx"].get("serialized"):
-            serialized_b64 = swap_resp["tx"]["serialized"]
-
-    if not serialized_b64:
-        raise Exception(f"Could not find serialized tx in Jupiter swap response: {swap_resp}")
-
-    # 3) Deserialize transaction, sign locally, and send
-    tx_bytes = b64decode(serialized_b64)
-    # Solana-py expects Transaction.from_solders or from_bytes; we can send raw signed tx by signing locally using Keypair
-    # We'll use RPC send_raw_transaction after signing bytes with our keypair.
-    # Build Keypair from PRIVATE_KEY_B58 (assuming it's a base58 secret key pair string or JSON)
+async def sell_flow_async(context: ContextTypes.DEFAULT_TYPE, percent: int, mint: str):
     try:
-        # PRIVATE_KEY may be base58 string of 64 or 32 length or a JSON array - handle common formats:
-        kp = None
-        # Try JSON array of ints
-        if PRIVATE_KEY_B58.strip().startswith('['):
-            arr = json.loads(PRIVATE_KEY_B58)
-            kp = Keypair.from_secret_key(bytes(arr))
-        else:
-            # try base58 decode => get 64 bytes seed? solana.Keypair doesn't load from base58 directly
-            # As a practical approach, accept that user will provide secret key as JSON array in .env for solana-py compatibility.
-            # If not, raise instructive error.
-            raise Exception("PRIVATE_KEY format not supported. Use JSON array secret key for now (see README).")
-    except Exception as e:
-        raise Exception(f"Failed to construct keypair for signing: {e}")
+        res = await asyncio.to_thread(hel_rpccall, "getTokenAccountsByOwner",
+                                      [MY_WALLET, {"mint": mint}, {"encoding": "jsonParsed"}])
+        arr = res.get("result", {}).get("value", []) or []
+        if not arr:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"No token account found for {mint} in {MY_WALLET}.")
+            return
 
-    # Sign raw tx_bytes using Keypair -> this is nontrivial with raw serialized tx; solana-py expects Transaction object
-    # Approach: attempt to use RPC send_raw_transaction with already-signed tx if Jupiter returned signed tx (rare).
-    # If Jupiter returned unsigned transaction, a full implementation requires parsing the tx, adding signatures, and serializing.
-    # This function will attempt to detect if Jupiter returned a signed tx already:
-    try:
-        # If swap_resp included 'signedTransaction' or 'swapTransaction' that is already signed, we can send directly
-        # Attempt to send raw tx to RPC
-        send_resp = sol_client.send_raw_transaction(tx_bytes, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed))
-        sig = send_resp.get("result")
-        return sig
-    except Exception as e:
-        raise Exception(f"Failed to send raw tx bytes: {e}")
+        acct = arr[0]
+        token_balance = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+        ui_amount = token_balance.get("uiAmount")
+        decimals = token_balance.get("decimals")
+        if ui_amount is None or decimals is None:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"Unable to read token balance for {mint}.")
+            return
 
-# ----------------- Callback handling (Telegram button presses) -----------------
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        sell_amount_ui = Decimal(ui_amount) * (Decimal(percent) / Decimal(100))
+        base_units = int(sell_amount_ui * (Decimal(10) ** Decimal(decimals)))
+        if base_units <= 0:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"Sell amount too small ({sell_amount_ui}) for {mint}.")
+            return
+
+        sig = await asyncio.to_thread(create_and_send_swap, mint, SOL_MINT, base_units, 500, MY_WALLET)
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"Sell tx submitted: {sig}")
+
+        if mint in positions:
+            del positions[mint]
+    except Exception as e:
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"Sell flow error for {mint}: {e}")
+
+
+async def monitor_position_async(context: ContextTypes.DEFAULT_TYPE, mint: str):
+    start = positions.get(mint, {}).get("start_ts", int(time.time()))
+    entry_price = positions.get(mint, {}).get("entry_price_lamports_per_unit")
+
+    while True:
+        if mint not in positions:
+            return
+
+        elapsed = int(time.time()) - start
+        profit_reached = False
+
+        if entry_price:
+            try:
+                probe = await asyncio.to_thread(jupiter_route_probe_to_sol, mint, 1)
+                if probe.get("ok"):
+                    data = probe.get("data", {}).get("data") or []
+                    if data and data[0].get("outAmount"):
+                        current_out = Decimal(int(data[0]["outAmount"]))
+                        # entry_price is lamports per base unit; current_out is lamports per base unit (for amount=1)
+                        if entry_price > 0 and (current_out / Decimal(entry_price)) >= PROFIT_MULTIPLIER:
+                            profit_reached = True
+            except Exception:
+                pass
+
+        if profit_reached:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"🚀 Profit target reached for {mint} (≥ {int((PROFIT_MULTIPLIER - 1) * 100)}% gain). Choose SELL:",
+                reply_markup=build_sell_keyboard(mint),
+            )
+            return
+
+        if elapsed >= MAX_WAIT_SECONDS:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"⏰ 45 minutes elapsed for {mint}. Do you want to SELL?",
+                reply_markup=build_sell_keyboard(mint),
+            )
+            return
+
+        await asyncio.sleep(MONITOR_POLL)
+
+
+# ----------------- Telegram handlers -----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Trade Assist ready. Watching wallet...")
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data or ""
-    # data patterns: BUY|25|<mint>  IGNORE|<mint>  SELL|50|<mint> HOLD|<mint>
-    parts = data.split("|")
-    action = parts[0]
+    data = (query.data or "").split("|")
+    action = data[0] if data else ""
+
     if action == "IGNORE":
         await query.edit_message_text("Ignored.")
         return
 
-    if action == "BUY" and len(parts) == 3:
-        pct = int(parts[1])
-        mint = parts[2]
-        await query.edit_message_text(f"Buying {pct}% of SOL balance for {mint} — preparing swap (will sign locally).")
-        # Run buy in background
-        threading.Thread(target=do_buy_flow, args=(pct, mint), daemon=True).start()
+    if action == "BUY" and len(data) == 3:
+        pct = int(data[1]); mint = data[2]
+        await query.edit_message_text(f"Buying {pct}% into {mint} (preparing swap)...")
+        asyncio.create_task(buy_flow_async(context, pct, mint))
         return
 
-    if action == "SELL" and len(parts) == 3:
-        pct = int(parts[1])
-        mint = parts[2]
-        await query.edit_message_text(f"Selling {pct}% of token {mint} — preparing swap.")
-        threading.Thread(target=do_sell_flow, args=(pct, mint), daemon=True).start()
+    if action == "SELL" and len(data) == 3:
+        pct = int(data[1]); mint = data[2]
+        await query.edit_message_text(f"Selling {pct}% of {mint} (preparing swap)...")
+        asyncio.create_task(sell_flow_async(context, pct, mint))
         return
 
     if action == "HOLD":
@@ -405,138 +535,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("Unknown action.")
 
-# ----------------- Buy / Sell workflows -----------------
-def do_buy_flow(percent: int, mint: str):
-    """
-    Buy percent% of available SOL balance into 'mint' token.
-    Steps:
-     - fetch SOL balance
-     - compute lamports to spend
-     - request Jupiter quote & swap tx
-     - sign & send (calls create_and_send_swap)
-     - record position details for monitoring
-    """
-    try:
-        lamports = get_sol_balance_lamports(MY_WALLET)
-        # reduce a small buffer for fees
-        buffer_lamports = 20000  # ~0.00002 SOL buffer
-        spend = int((lamports - buffer_lamports) * (Decimal(percent) / Decimal(100)))
-        if spend <= 0:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"Insufficient SOL balance to buy {mint} at {percent}%. Balance (lamports): {lamports}")
-            return
-        # Jupiter expects inputMint = SOL placeholder and amount in lamports
-        SOL_PLACE = "So11111111111111111111111111111111111111112"
-        # Create & send swap
-        txsig = create_and_send_swap(SOL_PLACE, mint, spend, slippage_bps=500, user_pubkey=MY_WALLET)
-        app.bot.send_message(chat_id=CHAT_ID, text=f"Buy tx submitted: {txsig}\nRecording position and starting monitor.")
-        # store position minimal info (we'll try to estimate entry price using Jupiter quote probe)
-        # probe quote for current price: ask how much token for 'spend' lamports
-        probe = requests.get(JUPITER_QUOTE_V6, params={"inputMint": SOL_PLACE, "outputMint": mint, "amount": str(spend), "slippageBps": "500"}).json()
-        entry_price_ft = None
-        if probe.get("data") and len(probe["data"])>0:
-            # estimate token amount out in base units
-            token_out = int(probe["data"][0]["outAmount"]) if probe["data"][0].get("outAmount") else None
-            # To compute entry price in SOL per token: price = spend_lamports / token_out (lamports per smallest token unit)
-            if token_out:
-                entry_price_ft = Decimal(spend) / Decimal(token_out)  # lamports per token base unit
-        positions[mint] = {"lamports_spent": spend, "entry_price_lamports_per_unit": entry_price_ft, "start_ts": int(time.time())}
-        # start monitor thread
-        threading.Thread(target=monitor_position, args=(mint,), daemon=True).start()
-    except Exception as e:
-        app.bot.send_message(chat_id=CHAT_ID, text=f"Buy flow error for {mint}: {e}")
 
-def do_sell_flow(percent: int, mint: str):
-    """
-    Sell percent% of the token amount held in MY_WALLET.
-    Steps:
-     - find token account balance (via Helius)
-     - compute percent amount in base units
-     - call create_and_send_swap(token -> SOL)
-    """
-    try:
-        # find token accounts for MY_WALLET and mint (via getTokenAccountsByOwner)
-        # Use RPC method getTokenAccountsByOwner with mint filter
-        res = hel_rpccall("getTokenAccountsByOwner", [MY_WALLET, {"mint": mint}, {"encoding": "jsonParsed"}])
-        arr = res.get("result", {}).get("value", [])
-        if not arr:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"No token account found for mint {mint} in wallet {MY_WALLET}.")
-            return
-        # pick the first token account
-        acct = arr[0]
-        acct_pub = acct.get("pubkey")
-        token_balance = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
-        ui_amount = token_balance.get("uiAmount")
-        decimals = token_balance.get("decimals")
-        if ui_amount is None:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"Unable to read token balance for {mint}.")
-            return
-        sell_amount_ui = Decimal(ui_amount) * (Decimal(percent)/Decimal(100))
-        # convert UI to base units
-        base_units = int(sell_amount_ui * (Decimal(10) ** Decimal(decimals)))
-        if base_units <= 0:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"Sell amount too small ({sell_amount_ui}) for {mint}.")
-            return
-        # perform swap: inputMint = mint, outputMint = SOL
-        txsig = create_and_send_swap(mint, "So11111111111111111111111111111111111111112", base_units, slippage_bps=500, user_pubkey=MY_WALLET)
-        app.bot.send_message(chat_id=CHAT_ID, text=f"Sell tx submitted: {txsig}")
-        # remove/adjust positions record if present
-        if mint in positions:
-            del positions[mint]
-    except Exception as e:
-        app.bot.send_message(chat_id=CHAT_ID, text=f"Sell flow error for {mint}: {e}")
+def build_app() -> Application:
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.job_queue.run_repeating(poll_watch_wallet_job, interval=CHECK_INTERVAL, first=5)
+    return app
 
-# ----------------- Monitor position for conditions -----------------
-def monitor_position(mint: str):
-    """
-    Monitor the position for +1500% or 45 minutes. When condition happens, alert user with SELL buttons.
-    """
-    start = positions.get(mint, {}).get("start_ts", int(time.time()))
-    entry_price = positions.get(mint, {}).get("entry_price_lamports_per_unit")
-    # If entry_price unknown, we can alert on time only
-    while True:
-        if mint not in positions:
-            return
-        now = int(time.time())
-        elapsed = now - start
-        # check profit if we have entry price
-        profit_reached = False
-        if entry_price:
-            # probe current price: ask how many lamports per token unit via Jupiter quote token->SOL for 1 unit
-            try:
-                probe = jupiter_route_probe_to_sol(mint, 10 ** 0)  # small probe; may not be exact
-                if probe.get("ok") and probe.get("data") and probe["data"][0].get("outAmount"):
-                    current_out = int(probe["data"][0]["outAmount"])
-                    # current price lamports per unit = input lamports? For token->SOL quotes outAmount is in lamports of SOL for 1 base unit
-                    current_price = Decimal(current_out)  # lamports of SOL per base unit (depends on quote shape)
-                    # profit ratio = current_price / entry_price
-                    if entry_price > 0 and current_price / Decimal(entry_price) >= PROFIT_MULTIPLIER:
-                        profit_reached = True
-            except Exception:
-                pass
-        # Trigger conditions
-        if profit_reached:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"🚀 Profit target reached for {mint} (>= {int((PROFIT_MULTIPLIER-1)*100)}% gain). Choose SELL:", reply_markup=build_sell_keyboard(mint))
-            return
-        if elapsed >= MAX_WAIT_SECONDS:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"⏰ 45 minutes elapsed for {mint}. Do you want to SELL?", reply_markup=build_sell_keyboard(mint))
-            return
-        time.sleep(MONITOR_POLL)
-
-# ----------------- Startup: webhook handlers and main loop -----------------
-app.add_handler(CallbackQueryHandler(callback_handler))
-
-def start_polling_loop():
-    print("Starting watcher loop for", WATCH_WALLET)
-    while True:
-        try:
-            poll_watch_wallet()
-        except Exception as e:
-            print("Watcher loop error:", e)
-        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    # Start the watcher loop in a background thread, start the telegram bot in main thread
-    t = threading.Thread(target=start_polling_loop, daemon=True)
-    t.start()
-    print("Telegram bot starting (callback handler active).")
-    app.run_polling()
+    # Optional: sanity check that PRIVATE_KEY matches MY_WALLET
+    try:
+        kp = load_keypair_from_env()
+        if str(kp.pubkey()) != MY_WALLET:
+            print(f"Warning: PRIVATE_KEY pubkey {kp.pubkey()} != MY_WALLET {MY_WALLET}")
+    except Exception as e:
+        raise SystemExit(f"PRIVATE_KEY could not be loaded: {e}")
+
+    application = build_app()
+    application.run_polling()
