@@ -1,0 +1,1 @@
+worker: python solana_trade_assist.py
