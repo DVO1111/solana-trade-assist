@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]==22.3
+solana==0.36.9
+solders==0.26.0
+requests
+python-dotenv
