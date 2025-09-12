@@ -1,1 +1,1 @@
-worker: python solana_trade_assist.py
+worker: python watcher.py
