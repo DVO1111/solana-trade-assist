@@ -26,7 +26,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
 STATE_FILE = "last_sig.json"
-POLL_INTERVAL_SEC = 8
+POLL_INTERVAL_SEC = 20   # safer for Helius free tier
+MAX_BACKOFF = 300        # cap exponential backoff at 5 minutes
 
 # ===== STATE STORAGE =====
 def load_last_signature() -> Optional[str]:
@@ -142,6 +143,9 @@ def poll_watch_wallet():
     last_sig = load_last_signature()
     print(f"[INIT] last_seen_signature={last_sig}")
 
+    retry_delay = POLL_INTERVAL_SEC
+    last_heartbeat = time.time()
+
     while True:
         try:
             txs = fetch_recent_transactions(WATCH_WALLET, before=None, limit=20)
@@ -149,12 +153,7 @@ def poll_watch_wallet():
             if txs:
                 txs_sorted = sorted(txs, key=lambda t: t.get("timestamp", 0))
                 if last_sig:
-                    new_batch = []
-                    for t in txs_sorted:
-                        if t.get("signature") == last_sig:
-                            new_batch = []
-                        else:
-                            new_batch.append(t)
+                    new_batch = [t for t in txs_sorted if t.get("signature") != last_sig]
                 else:
                     new_batch = txs_sorted
 
@@ -178,14 +177,32 @@ def poll_watch_wallet():
                         save_last_signature(newest_sig)
                         last_sig = newest_sig
 
+            # Reset retry delay after success
+            retry_delay = POLL_INTERVAL_SEC
+
+            # Heartbeat every 5 minutes
+            if time.time() - last_heartbeat > 300:
+                print("[HEARTBEAT] Watcher is alive.")
+                last_heartbeat = time.time()
+
             time.sleep(POLL_INTERVAL_SEC)
 
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                print(f"[RATE LIMIT] Too many requests. Backing off for {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, MAX_BACKOFF)
+            else:
+                print(f"[NETWORK] HTTP error: {e}. Retrying in 10s...")
+                time.sleep(10)
+
         except requests.RequestException as e:
-            print(f"[NETWORK] {e}. Retrying in 5s...")
-            time.sleep(5)
+            print(f"[NETWORK] {e}. Retrying in 10s...")
+            time.sleep(10)
+
         except Exception as e:
             print(f"[ERROR] {e}")
-            time.sleep(3)
+            time.sleep(5)
 
 # ===== MAIN =====
 if __name__ == "__main__":
